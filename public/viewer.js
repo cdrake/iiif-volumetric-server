@@ -47,6 +47,7 @@ const els = {
   manifestUrl: document.getElementById("manifestUrl"),
   colormap: document.getElementById("colormap"),
   windowInput: document.getElementById("window"),
+  resLevel: document.getElementById("resLevel"),
   apiPill: document.getElementById("apiPill"),
   niivuePill: document.getElementById("niivuePill"),
   fallback: document.getElementById("nv-fallback"),
@@ -106,6 +107,19 @@ async function selectVolume(id) {
   for (const el of els.vols.querySelectorAll(".vol-item")) {
     el.classList.toggle("active", el.dataset.id === id);
   }
+
+  // Update resolution selector
+  els.resLevel.innerHTML = '<option value="0">Full (Native)</option>';
+  if (state.current.levels && state.current.levels.length > 1) {
+    state.current.levels.forEach((l) => {
+      if (l.level === 0) return;
+      const opt = document.createElement("option");
+      opt.value = l.level;
+      opt.textContent = `Level ${l.level} (${l.shape.join("×")})`;
+      els.resLevel.appendChild(opt);
+    });
+  }
+
   // Always fetch the single manifest (drives slice panes).
   const singleManifestUrl = `${state.baseUrl}/iiif/presentation/${encodeURIComponent(id)}/manifest`;
   state.manifest = await fetch(singleManifestUrl).then((r) => r.json());
@@ -161,6 +175,7 @@ async function refreshManifestForMode() {
   let displayedManifestUrl;
   let summary = "";
   if (exploded) {
+    const level = Number(els.resLevel.value);
     const qs = new URLSearchParams({
       nx: els.explodeNx.value,
       ny: els.explodeNy.value,
@@ -169,6 +184,7 @@ async function refreshManifestForMode() {
       ey: els.explodeEy.value,
       ez: els.explodeEz.value,
     });
+    if (level > 0) qs.set("level", level);
     displayedManifestUrl = `${state.baseUrl}/iiif/presentation/${encodeURIComponent(id)}/exploded/manifest?${qs}`;
     state.explodedManifest = await fetch(displayedManifestUrl).then((r) =>
       r.json()
@@ -196,7 +212,21 @@ async function refreshManifestForMode() {
       return;
     }
     const ann = scene.items?.[0]?.items?.[0];
-    const body = ann?.body;
+    let body = ann?.body;
+    if (!body) {
+      showFallback("Manifest scene has no annotation body.");
+      return;
+    }
+
+    if (body.type === "Choice") {
+      // Pick the item matching selected level, or first if level=0
+      const level = Number(els.resLevel.value);
+      const targetId =
+        level === 0 ? "/raw" : `level=${level}`;
+      const match = body.items.find((it) => it.id.includes(targetId));
+      body = match || body.items[0];
+    }
+
     if (!body || body.type !== "Model") {
       showFallback("Manifest scene has no Model annotation body.");
       return;
@@ -268,6 +298,7 @@ function setupControls() {
   };
   els.colormap.addEventListener("change", reload);
   els.windowInput.addEventListener("change", reload);
+  els.resLevel.addEventListener("change", reload);
   els.explodedToggle.addEventListener("change", reload);
   
   for (const axis of ["Ex", "Ey", "Ez"]) {

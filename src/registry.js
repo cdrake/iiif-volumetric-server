@@ -9,13 +9,16 @@ import { niftiAdapter } from "./adapters/nifti.js";
 import { nrrdAdapter } from "./adapters/nrrd.js";
 import { dicomAdapter } from "./adapters/dicom.js";
 import { omezarrAdapter } from "./adapters/omezarr.js";
+import { downsampleVolume } from "./util/downsample.js";
+import { encodeNifti } from "./util/niftiEncoder.js";
 
 const ADAPTERS = [niftiAdapter, nrrdAdapter, omezarrAdapter, dicomAdapter];
 
 class Registry {
   constructor() {
-    /** @type {Map<string, {id:string, format:string, source:string, adapter:any, shape:number[], dtype:string, spacing:number[], volume:any}>} */
+    /** @type {Map<string, {id:string, format:string, source:string, adapter:any, shape:number[], dtype:string, spacing:number[], levels: any[], volume:any}>} */
     this.entries = new Map();
+    this.cacheDir = null;
   }
 
   size() {
@@ -30,6 +33,7 @@ class Registry {
       dtype: e.dtype,
       spacing: e.spacing,
       source: e.source,
+      levels: e.levels,
     }));
   }
 
@@ -63,6 +67,11 @@ class Registry {
    * files becomes a single registered volume).
    */
   async scan(dir) {
+    this.cacheDir = path.join(dir, ".cache");
+    try {
+      await fs.mkdir(this.cacheDir, { recursive: true });
+    } catch (_) {}
+
     let items;
     try {
       items = await fs.readdir(dir, { withFileTypes: true });
@@ -75,8 +84,10 @@ class Registry {
     }
 
     for (const item of items) {
+      if (item.name === ".cache") continue;
       const full = path.join(dir, item.name);
       try {
+        let entry;
         if (item.isDirectory()) {
           // DICOM series live as directories; OME-Zarr stores are also
           // directory trees ending in .zarr or .ome.zarr.
@@ -86,7 +97,7 @@ class Registry {
           if (!adapter) continue;
           const id = sanitizeId(item.name);
           const probe = await adapter.probe(full);
-          this.entries.set(id, {
+          entry = {
             id,
             format: adapter.format,
             adapter,
@@ -94,8 +105,9 @@ class Registry {
             shape: probe.shape,
             dtype: probe.dtype,
             spacing: probe.spacing,
+            levels: [],
             volume: null,
-          });
+          };
         } else if (item.isFile()) {
           const adapter = ADAPTERS.find((a) =>
             a.canHandle(full, { isDirectory: false })
@@ -103,7 +115,7 @@ class Registry {
           if (!adapter) continue;
           const id = sanitizeId(stripVolumeExtensions(item.name));
           const probe = await adapter.probe(full);
-          this.entries.set(id, {
+          entry = {
             id,
             format: adapter.format,
             adapter,
@@ -111,8 +123,15 @@ class Registry {
             shape: probe.shape,
             dtype: probe.dtype,
             spacing: probe.spacing,
+            levels: [],
             volume: null,
-          });
+          };
+        }
+        if (entry) {
+          this.entries.set(entry.id, entry);
+          await this._refreshLevels(entry);
+          // Trigger background pyramid generation if missing
+          this._generatePyramidBackground(entry.id);
         }
       } catch (err) {
         console.warn(
@@ -120,6 +139,73 @@ class Registry {
         );
       }
     }
+  }
+
+  async _refreshLevels(entry) {
+    const levels = [{ level: 0, shape: entry.shape, spacing: entry.spacing }];
+    for (let l = 1; l <= 3; l++) {
+      const p = path.join(this.cacheDir, `${entry.id}_L${l}.nii.gz`);
+      try {
+        await fs.access(p);
+        // Level exists, probe it to get shape/spacing
+        const probe = await niftiAdapter.probe(p);
+        levels.push({
+          level: l,
+          shape: probe.shape,
+          spacing: probe.spacing,
+          path: p,
+        });
+      } catch (_) {
+        // missing
+      }
+    }
+    entry.levels = levels;
+  }
+
+  async _generatePyramidBackground(id) {
+    const entry = this.entries.get(id);
+    if (!entry || entry.format !== "nifti") return;
+
+    // Check if we already have levels
+    if (entry.levels.length > 1) return;
+
+    // Don't await this, let it run in background
+    this._doGeneratePyramid(id).catch((err) => {
+      console.error(`Failed to generate pyramid for ${id}:`, err);
+    });
+  }
+
+  async _doGeneratePyramid(id) {
+    console.log(`Generating pyramid for ${id}...`);
+    const entry = await this.load(id);
+    let currentVolume = entry.volume;
+    for (let l = 1; l <= 3; l++) {
+      const p = path.join(this.cacheDir, `${id}_L${l}.nii.gz`);
+      try {
+        await fs.access(p);
+        // already exists, load it as current for next level
+        const next = await niftiAdapter.load(p);
+        currentVolume = next;
+        continue;
+      } catch (_) {}
+
+      try {
+        const down = downsampleVolume(currentVolume, 2);
+        const encoded = encodeNifti({
+          data: down.data,
+          shape: down.shape,
+          spacing: down.spacing,
+          dtype: down.dtype,
+        });
+        await fs.writeFile(p, encoded);
+        console.log(`  - Wrote ${id} level ${l} (${down.shape.join("x")})`);
+        currentVolume = down;
+      } catch (err) {
+        console.warn(`  - Could not generate level ${l} for ${id}: ${err.message}`);
+        break;
+      }
+    }
+    await this._refreshLevels(entry);
   }
 }
 

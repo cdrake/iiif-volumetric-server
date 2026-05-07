@@ -114,6 +114,7 @@ async function main() {
         format: v.format,
         shape: v.shape,
         dtype: v.dtype,
+        levels: v.levels,
         manifest: `${PUBLIC_BASE_URL}/iiif/presentation/${v.id}/manifest`,
         raw: `${PUBLIC_BASE_URL}/volumes/${v.id}/raw`,
         slices: {

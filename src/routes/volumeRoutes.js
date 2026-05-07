@@ -16,6 +16,10 @@ import { gzipSync } from "node:zlib";
 import nifti from "nifti-reader-js";
 
 import {
+  encodeNifti,
+} from "../util/niftiEncoder.js";
+
+import {
   planExplodedView,
   composeExplodedBuffer,
 } from "../iiif/explode.js";
@@ -40,29 +44,58 @@ export function mountVolumeRoutes(app, registry) {
       }
 
       const bbox = parseBbox(req.query.bbox);
-      if (!bbox) {
-        await streamSource(entry, res);
+      const levelIdx = Number(req.query.level ?? 0);
+
+      if (!bbox && levelIdx > 0) {
+        // Stream full level file if no bbox requested
+        const level = entry.levels.find((l) => l.level === levelIdx);
+        if (level && level.path) {
+          res.set("Content-Type", "application/x.nifti+gzip");
+          res.set(
+            "Content-Disposition",
+            `inline; filename="${entry.id}_L${levelIdx}.nii.gz"`
+          );
+          res.set("Cache-Control", "public, max-age=3600");
+          fs.createReadStream(level.path).pipe(res);
+          return;
+        }
+      }
+
+      if (bbox) {
+        // Subvolume crop: only NIfTI is implemented in this POC.
+        if (entry.format !== "nifti") {
+          const err = new Error(
+            `bbox crop is only implemented for NIfTI sources in this POC (got format=${entry.format})`
+          );
+          err.status = 501;
+          throw err;
+        }
+
+        let volumeToCrop = entry.volume;
+        if (levelIdx > 0) {
+          const level = entry.levels.find((l) => l.level === levelIdx);
+          if (level && level.path) {
+            // Load the downsampled volume to crop it
+            volumeToCrop = await niftiAdapter.load(level.path);
+          }
+        } else {
+            await registry.load(entry.id);
+            volumeToCrop = entry.volume;
+        }
+
+        const cropped = cropNifti(volumeToCrop, bbox);
+        res.set("Content-Type", "application/x.nifti");
+        res.set(
+          "Content-Disposition",
+          `inline; filename="${entry.id}_crop.nii.gz"`
+        );
+        res.set("Cache-Control", "public, max-age=3600");
+        res.send(cropped);
         return;
       }
 
-      // Subvolume crop: only NIfTI is implemented in this POC.
-      if (entry.format !== "nifti") {
-        const err = new Error(
-          `bbox crop is only implemented for NIfTI sources in this POC (got format=${entry.format})`
-        );
-        err.status = 501;
-        throw err;
-      }
-
-      await registry.load(entry.id);
-      const cropped = cropNifti(entry, bbox);
-      res.set("Content-Type", "application/x.nifti");
-      res.set(
-        "Content-Disposition",
-        `inline; filename="${entry.id}_crop.nii.gz"`
-      );
-      res.set("Cache-Control", "public, max-age=3600");
-      res.send(cropped);
+      // Default: stream original source
+      await streamSource(entry, res);
     })
   );
 
@@ -78,6 +111,7 @@ export function mountVolumeRoutes(app, registry) {
     ],
     asyncHandler(async (req, res) => {
       const entry = await registry.load(req.params.volId);
+      const levelIdx = Number(req.query.level ?? 0);
       const params = {
         nx: Number(req.query.nx ?? 3),
         ny: Number(req.query.ny ?? 3),
@@ -87,8 +121,17 @@ export function mountVolumeRoutes(app, registry) {
         ey: req.query.ey ? Number(req.query.ey) : undefined,
         ez: req.query.ez ? Number(req.query.ez) : undefined,
       };
-      const layout = planExplodedView(entry.volume, params);
-      const out = composeExplodedBuffer(entry.volume, layout);
+
+      let baseVolume = entry.volume;
+      if (levelIdx > 0) {
+        const level = entry.levels.find((l) => l.level === levelIdx);
+        if (level && level.path) {
+          baseVolume = await niftiAdapter.load(level.path);
+        }
+      }
+
+      const layout = planExplodedView(baseVolume, params);
+      const out = composeExplodedBuffer(baseVolume, layout);
       const buffer = encodeNifti({
         data: out,
         shape: layout.compositeShape,
@@ -111,6 +154,7 @@ export function mountVolumeRoutes(app, registry) {
     "/volumes/:volId/exploded/plan",
     asyncHandler(async (req, res) => {
       const entry = await registry.load(req.params.volId);
+      const levelIdx = Number(req.query.level ?? 0);
       const params = {
         nx: Number(req.query.nx ?? 3),
         ny: Number(req.query.ny ?? 3),
@@ -120,7 +164,16 @@ export function mountVolumeRoutes(app, registry) {
         ey: req.query.ey ? Number(req.query.ey) : undefined,
         ez: req.query.ez ? Number(req.query.ez) : undefined,
       };
-      const layout = planExplodedView(entry.volume, params);
+
+      let baseVolume = entry.volume;
+      if (levelIdx > 0) {
+        const level = entry.levels.find((l) => l.level === levelIdx);
+        if (level && level.path) {
+          baseVolume = await niftiAdapter.load(level.path);
+        }
+      }
+
+      const layout = planExplodedView(baseVolume, params);
       res.json({
         volumeId: entry.id,
         params: layout.params,
@@ -144,6 +197,7 @@ export function mountVolumeRoutes(app, registry) {
         spacing: entry.volume.spacing,
         dtype: entry.volume.dtype,
         units: entry.volume.units,
+        levels: entry.levels,
         intensityRange: entry.volume.intensityRange(),
         metadata: entry.volume.metadata,
       });
@@ -247,97 +301,8 @@ function cropNifti(entry, bbox) {
   });
 }
 
-/**
- * Build a gzipped NIfTI-1 file from a typed array + dims + dtype.
- * Used by both the bbox crop endpoint and the exploded-view endpoint.
- */
-function encodeNifti({ data, shape, spacing, dtype }) {
-  const colorBytes = dtype === "rgb24" ? 3 : dtype === "rgba32" ? 4 : 0;
-  const elemBytes = colorBytes || data.BYTES_PER_ELEMENT;
-  const header = makeNifti1Header({
-    dims: shape,
-    pixDims: spacing,
-    datatypeCode: dtypeNameToNiftiCode(dtype),
-    bitsPerVoxel: elemBytes * 8,
-  });
-  const fileBuf = Buffer.alloc(352 + data.byteLength);
-  Buffer.from(header).copy(fileBuf, 0);
-  Buffer.from(data.buffer, data.byteOffset, data.byteLength).copy(
-    fileBuf,
-    352
-  );
-  return gzipSync(fileBuf);
-}
-
 function clamp(n, lo, hi) {
   return Math.max(lo, Math.min(hi, n));
-}
-
-function dtypeNameToNiftiCode(name) {
-  switch (name) {
-    case "uint8":
-      return nifti.NIFTI1.TYPE_UINT8;
-    case "int8":
-      return nifti.NIFTI1.TYPE_INT8;
-    case "int16":
-      return nifti.NIFTI1.TYPE_INT16;
-    case "uint16":
-      return nifti.NIFTI1.TYPE_UINT16;
-    case "int32":
-      return nifti.NIFTI1.TYPE_INT32;
-    case "uint32":
-      return nifti.NIFTI1.TYPE_UINT32;
-    case "float32":
-      return nifti.NIFTI1.TYPE_FLOAT32;
-    case "float64":
-      return nifti.NIFTI1.TYPE_FLOAT64;
-    case "rgb24":
-      return 128;
-    case "rgba32":
-      return 2304;
-    default:
-      throw new Error(`Cannot map dtype to NIfTI datatype: ${name}`);
-  }
-}
-
-/**
- * Build a minimal NIfTI-1 header (348 + 4 padding = 352 bytes,
- * vox_offset=352). We fill the canonical fields and leave qform/sform
- * unset — viewers will fall back to using pixdim and treat the data
- * as in voxel coordinates.
- */
-function makeNifti1Header({ dims, pixDims, datatypeCode, bitsPerVoxel }) {
-  const buf = new ArrayBuffer(352);
-  const view = new DataView(buf);
-  // sizeof_hdr
-  view.setInt32(0, 348, true);
-  // dim[8] starts at offset 40
-  view.setInt16(40, 3, true); // dim[0] = 3 (3D volume)
-  view.setInt16(42, dims[0], true);
-  view.setInt16(44, dims[1], true);
-  view.setInt16(46, dims[2], true);
-  view.setInt16(48, 1, true);
-  view.setInt16(50, 1, true);
-  view.setInt16(52, 1, true);
-  view.setInt16(54, 1, true);
-  // datatype at offset 70, bitpix at 72
-  view.setInt16(70, datatypeCode, true);
-  view.setInt16(72, bitsPerVoxel, true);
-  // pixdim[8] at offset 76
-  view.setFloat32(76, 1, true); // pixdim[0]
-  view.setFloat32(80, pixDims[0] || 1, true);
-  view.setFloat32(84, pixDims[1] || 1, true);
-  view.setFloat32(88, pixDims[2] || 1, true);
-  // vox_offset at 108
-  view.setFloat32(108, 352, true);
-  // scl_slope at 112, scl_inter at 116 — leave 0 (means no scaling)
-  // magic "n+1\0" at 344
-  const magic = new Uint8Array(buf, 344, 4);
-  magic[0] = 0x6e; // n
-  magic[1] = 0x2b; // +
-  magic[2] = 0x31; // 1
-  magic[3] = 0x00;
-  return buf;
 }
 
 function asyncHandler(fn) {
