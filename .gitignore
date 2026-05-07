@@ -1,0 +1,5 @@
+node_modules/
+fixtures/*
+!fixtures/.gitkeep
+.DS_Store
+.env

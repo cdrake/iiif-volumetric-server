@@ -1,0 +1,356 @@
+// IIIF Presentation API 4.0 alpha (draft 3D) manifest generation.
+//
+// Spec: https://preview.iiif.io/api/prezi-4/presentation/4.0/
+//
+// We generate a Manifest containing:
+//   - Three 2D Canvases (one per anatomical axis), each painted by a
+//     sequence of Annotations whose body is an ImageService3 pointing
+//     at /iiif/image/{volId}/{axis}/{slice}. This part works in any
+//     existing Image API 3.0 viewer (Mirador, UV, Clover).
+//   - One Scene (the new 3D primitive) that contains a `Model`-bodied
+//     painting Annotation pointing at our raw NIfTI URL with format
+//     "application/x.nifti". A custom rendering hint (`rendering`)
+//     points at our viewer page driven by niivuegpu so 3D-aware
+//     clients (and our demo) know how to render it.
+//
+// NIfTI is not yet a registered IIIF media type, so we use
+// `application/x.nifti`; this is consistent with how the 3D TSG examples
+// declare model formats (e.g. `model/gltf-binary`). When the spec or
+// an extension adds an official type, swap it here.
+
+export const PREZI_4_CONTEXT =
+  "http://iiif.io/api/presentation/4/context.json";
+
+const NIFTI_MEDIA_TYPE = "application/x.nifti";
+
+/**
+ * @param {object} args
+ * @param {string} args.baseUrl     - Public base URL of this server.
+ * @param {object} args.entry       - Registry entry for the volume.
+ */
+export function buildManifest({ baseUrl, entry }) {
+  const id = encodeURIComponent(entry.id);
+  const manifestId = `${baseUrl}/iiif/presentation/${id}/manifest`;
+  const sceneId = `${baseUrl}/iiif/presentation/${id}/scene/0`;
+  const rawNiftiUrl = `${baseUrl}/volumes/${id}/raw.nii.gz`;
+  const viewerUrl = `${baseUrl}/?manifest=${encodeURIComponent(manifestId)}`;
+
+  const canvases = ["axial", "coronal", "sagittal"].map((axis) =>
+    buildSliceCanvas({ baseUrl, entry, axis, manifestId })
+  );
+
+  const scene = buildScene({
+    sceneId,
+    rawNiftiUrl,
+    entry,
+    viewerUrl,
+  });
+
+  const manifest = {
+    "@context": PREZI_4_CONTEXT,
+    id: manifestId,
+    type: "Manifest",
+    label: { en: [`Volume ${entry.id}`] },
+    summary: {
+      en: [
+        `Volumetric ${entry.format} dataset, ${entry.shape.join(
+          " × "
+        )}, dtype ${entry.dtype}.`,
+      ],
+    },
+    metadata: [
+      { label: { en: ["Format"] }, value: { en: [entry.format] } },
+      { label: { en: ["Shape"] }, value: { en: [entry.shape.join(" × ")] } },
+      { label: { en: ["Voxel spacing"] }, value: { en: [entry.spacing.join(" × ")] } },
+      { label: { en: ["Data type"] }, value: { en: [entry.dtype] } },
+    ],
+    rendering: [
+      {
+        id: rawNiftiUrl,
+        type: "Dataset",
+        label: { en: ["Raw NIfTI volume"] },
+        format: NIFTI_MEDIA_TYPE,
+      },
+      {
+        id: viewerUrl,
+        type: "Text",
+        label: { en: ["3D viewer (niivuegpu)"] },
+        format: "text/html",
+      },
+    ],
+    items: [...canvases, scene],
+  };
+  return manifest;
+}
+
+function buildSliceCanvas({ baseUrl, entry, axis, manifestId }) {
+  const [w, h] = sliceDims(entry.shape, axis);
+  const n = sliceCount(entry.shape, axis);
+  const middle = Math.floor(n / 2);
+  const id = `${manifestId}/canvas/${axis}`;
+  return {
+    id,
+    type: "Canvas",
+    label: { en: [`${cap(axis)} slice (mid=${middle} of ${n})`] },
+    width: w,
+    height: h,
+    items: [
+      {
+        id: `${id}/page`,
+        type: "AnnotationPage",
+        items: [
+          {
+            id: `${id}/annotation`,
+            type: "Annotation",
+            motivation: "painting",
+            target: id,
+            body: {
+              id: `${baseUrl}/iiif/image/${encodeURIComponent(entry.id)}/${axis}/${middle}/full/max/0/default.png`,
+              type: "Image",
+              format: "image/png",
+              width: w,
+              height: h,
+              service: [
+                {
+                  id: `${baseUrl}/iiif/image/${encodeURIComponent(entry.id)}/${axis}/${middle}`,
+                  type: "ImageService3",
+                  profile: "level1",
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+    behavior: ["paged"],
+    metadata: [
+      {
+        label: { en: ["Slice axis"] },
+        value: { en: [axis] },
+      },
+      {
+        label: { en: ["Slice count"] },
+        value: { en: [String(n)] },
+      },
+    ],
+  };
+}
+
+function buildScene({ sceneId, rawNiftiUrl, entry, viewerUrl }) {
+  // Per the 4.0 alpha:
+  //   - Scene is a Canvas-like primitive in 3D space (right-handed, Y up).
+  //   - Models are painted onto a Scene via Annotation with motivation
+  //     "painting", body type "Model", and a `format` MIME hint.
+  //
+  // The 3D TSG examples use `model/gltf-binary` for glTF. NIfTI has no
+  // registered model media type, so we use `application/x.nifti` and
+  // include an `extensions` block scoping our viewer hint.
+  const [sx, sy, sz] = entry.shape;
+  const [dx, dy, dz] = entry.spacing;
+  return {
+    id: sceneId,
+    type: "Scene",
+    label: { en: [`3D volume of ${entry.id}`] },
+    width: sx * dx,
+    height: sy * dy,
+    depth: sz * dz,
+    backgroundColor: "#000000",
+    items: [
+      {
+        id: `${sceneId}/page`,
+        type: "AnnotationPage",
+        items: [
+          {
+            id: `${sceneId}/annotation/model`,
+            type: "Annotation",
+            motivation: "painting",
+            target: sceneId,
+            body: {
+              id: rawNiftiUrl,
+              type: "Model",
+              format: NIFTI_MEDIA_TYPE,
+              label: { en: [`${entry.id} (NIfTI)`] },
+              // Volumetric extension hints: not part of the formal alpha
+              // yet, but consumed by our niivuegpu-driven viewer.
+              "https://example.org/iiif/volumetric#": {
+                shape: entry.shape,
+                spacing: entry.spacing,
+                dtype: entry.dtype,
+                viewer: viewerUrl,
+              },
+            },
+            // PointSelector at the volume centre (in scene units).
+            selector: {
+              type: "PointSelector",
+              x: (sx * dx) / 2,
+              y: (sy * dy) / 2,
+              z: (sz * dz) / 2,
+            },
+          },
+        ],
+      },
+    ],
+    rendering: [
+      {
+        id: viewerUrl,
+        type: "Text",
+        format: "text/html",
+        label: { en: ["3D viewer (niivuegpu)"] },
+      },
+    ],
+  };
+}
+
+/**
+ * Manifest that describes an "exploded view" of one volume:
+ * one Scene whose Annotation list contains one Model annotation per
+ * cell of an nx×ny×nz grid, each placed at its exploded position via
+ * a PointSelector, with a `rendering` link to a single composite
+ * NIfTI for clients that prefer to load the whole space as one volume
+ * (which is what our niivuegpu-driven viewer does).
+ *
+ * @param {object} args
+ * @param {string} args.baseUrl
+ * @param {object} args.entry      Registry entry for the source volume.
+ * @param {object} args.layout     Output of planExplodedView().
+ */
+export function buildExplodedManifest({ baseUrl, entry, layout }) {
+  const id = encodeURIComponent(entry.id);
+  const { nx, ny, nz, ex, ey, ez } = layout.params;
+  const qs = `nx=${nx}&ny=${ny}&nz=${nz}&ex=${ex}&ey=${ey}&ez=${ez}`;
+  const manifestId = `${baseUrl}/iiif/presentation/${id}/exploded/manifest?${qs}`;
+  const sceneId = `${baseUrl}/iiif/presentation/${id}/exploded/scene?${qs}`;
+  const compositeUrl = `${baseUrl}/volumes/${id}/exploded.nii.gz?${qs}`;
+  const viewerUrl = `${baseUrl}/?manifest=${encodeURIComponent(manifestId)}&mode=exploded`;
+
+  const [Cx, Cy, Cz] = layout.compositeShape;
+  const [dx, dy, dz] = layout.compositeSpacing;
+
+  const cellAnnotations = layout.cells.map((cell, idx) => {
+    const bboxQ = cell.sourceBbox.join(",");
+    const cellRawUrl = `${baseUrl}/volumes/${id}/raw.nii.gz?bbox=${bboxQ}`;
+    return {
+      id: `${sceneId}#cell-${idx}`,
+      type: "Annotation",
+      motivation: "painting",
+      target: sceneId,
+      label: {
+        en: [`Cell (${cell.i}, ${cell.j}, ${cell.k})`],
+      },
+      body: {
+        id: cellRawUrl,
+        type: "Model",
+        format: NIFTI_MEDIA_TYPE,
+        label: {
+          en: [`${entry.id} cell ${cell.i},${cell.j},${cell.k}`],
+        },
+        "https://example.org/iiif/volumetric#": {
+          gridIndex: [cell.i, cell.j, cell.k],
+          sourceBbox: cell.sourceBbox,
+          cellShape: layout.cellShape,
+        },
+      },
+      // PointSelector is the 3D TSG's canonical placement primitive.
+      // Coordinates are in scene units (voxel × spacing).
+      selector: {
+        type: "PointSelector",
+        x: cell.sceneCenter[0],
+        y: cell.sceneCenter[1],
+        z: cell.sceneCenter[2],
+      },
+    };
+  });
+
+  const scene = {
+    id: sceneId,
+    type: "Scene",
+    label: { en: [`Exploded view of ${entry.id} (${nx}×${ny}×${nz}, ex=${ex}, ey=${ey}, ez=${ez})`] },
+    width: Cx * dx,
+    height: Cy * dy,
+    depth: Cz * dz,
+    backgroundColor: "#000000",
+    items: [
+      {
+        id: `${sceneId}/page`,
+        type: "AnnotationPage",
+        items: cellAnnotations,
+      },
+    ],
+    rendering: [
+      {
+        id: compositeUrl,
+        type: "Dataset",
+        format: NIFTI_MEDIA_TYPE,
+        label: { en: ["Composite NIfTI (single volume render)"] },
+      },
+      {
+        id: viewerUrl,
+        type: "Text",
+        format: "text/html",
+        label: { en: ["3D viewer (niivuegpu)"] },
+      },
+    ],
+  };
+
+  return {
+    "@context": PREZI_4_CONTEXT,
+    id: manifestId,
+    type: "Manifest",
+    label: {
+      en: [`Exploded ${entry.id} ${nx}×${ny}×${nz} ex=${ex} ey=${ey} ez=${ez}`],
+    },
+    summary: {
+      en: [
+        `Exploded view of ${entry.id}: ${nx * ny * nz} cells of ${layout.cellShape.join(
+          "×"
+        )}, composite shape ${layout.compositeShape.join("×")}.`,
+      ],
+    },
+    metadata: [
+      { label: { en: ["Source volume"] }, value: { en: [entry.id] } },
+      { label: { en: ["Grid"] }, value: { en: [`${nx} × ${ny} × ${nz}`] } },
+      { label: { en: ["Explode factors"] }, value: { en: [`X=${ex}, Y=${ey}, Z=${ez}`] } },
+      {
+        label: { en: ["Cell shape"] },
+        value: { en: [layout.cellShape.join(" × ")] },
+      },
+      {
+        label: { en: ["Composite shape"] },
+        value: { en: [layout.compositeShape.join(" × ")] },
+      },
+    ],
+    rendering: [
+      {
+        id: compositeUrl,
+        type: "Dataset",
+        format: NIFTI_MEDIA_TYPE,
+        label: { en: ["Composite exploded NIfTI"] },
+      },
+      {
+        id: viewerUrl,
+        type: "Text",
+        format: "text/html",
+        label: { en: ["3D viewer (niivuegpu)"] },
+      },
+    ],
+    items: [scene],
+  };
+}
+
+function sliceDims(shape, axis) {
+  if (axis === "axial") return [shape[0], shape[1]];
+  if (axis === "coronal") return [shape[0], shape[2]];
+  if (axis === "sagittal") return [shape[1], shape[2]];
+  throw new Error(`Unknown axis: ${axis}`);
+}
+
+function sliceCount(shape, axis) {
+  if (axis === "axial") return shape[2];
+  if (axis === "coronal") return shape[1];
+  if (axis === "sagittal") return shape[0];
+  throw new Error(`Unknown axis: ${axis}`);
+}
+
+function cap(s) {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
