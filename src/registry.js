@@ -33,7 +33,11 @@ class Registry {
       dtype: e.dtype,
       spacing: e.spacing,
       source: e.source,
-      levels: e.levels,
+      levels: e.levels.map((l) => ({
+        level: l.level,
+        shape: l.shape,
+        spacing: l.spacing,
+      })),
     }));
   }
 

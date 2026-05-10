@@ -174,6 +174,7 @@ async function refreshManifestForMode() {
   let url;
   let displayedManifestUrl;
   let summary = "";
+  let levels = [];
   if (exploded) {
     const level = Number(els.resLevel.value);
     const qs = new URLSearchParams({
@@ -219,10 +220,18 @@ async function refreshManifestForMode() {
     }
 
     if (body.type === "Choice") {
+      levels = body.items.map((it) => {
+        const hints = it["https://example.org/iiif/volumetric#"] || {};
+        return {
+          url: it.id,
+          shape: hints.shape,
+          spacing: hints.spacing,
+        };
+      });
+
       // Pick the item matching selected level, or first if level=0
       const level = Number(els.resLevel.value);
-      const targetId =
-        level === 0 ? "/raw" : `level=${level}`;
+      const targetId = level === 0 ? "/raw" : `level=${level}`;
       const match = body.items.find((it) => it.id.includes(targetId));
       body = match || body.items[0];
     }
@@ -243,7 +252,7 @@ async function refreshManifestForMode() {
   try {
     const colormap = els.colormap.value || "Gray";
     const win = parseWindow(els.windowInput.value);
-    const opts = { url, colormap };
+    const opts = { url, colormap, levels };
     if (win) {
       opts.calMin = win.min;
       opts.calMax = win.max;

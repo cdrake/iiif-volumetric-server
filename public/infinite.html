@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IIIF Volumetric Server — Infinite Desktop</title>
+    <style>
+      :root { --bg: #1a1a1a; --fg: #e0e0e0; --accent: #4caf50; }
+      body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, sans-serif; overflow: hidden; }
+      #container { width: 100vw; height: 100vh; display: flex; flex-direction: column; }
+      #header { padding: 12px 20px; background: #252525; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 15px; }
+      h1 { margin: 0; font-size: 1.1rem; font-weight: 500; }
+      #nv-canvas { flex: 1; width: 100%; height: 100%; background: #000; display: block; }
+      #debug-log {
+        position: fixed; bottom: 20px; left: 20px; max-width: 400px; max-height: 200px;
+        overflow-y: auto; background: rgba(0,0,0,0.7); font-family: monospace;
+        font-size: 0.7rem; color: #8c8; padding: 8px; pointer-events: none; border-radius: 4px;
+      }
+      #controls {
+        position: fixed; bottom: 20px; right: 20px; background: rgba(0,0,0,0.85);
+        padding: 15px; border-radius: 8px; border: 1px solid #444; font-size: 0.8rem; z-index: 100;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="container">
+      <div id="header">
+        <h1>Infinite Volumetric Desktop</h1>
+        <div style="flex:1"></div>
+        <a href="/" style="color:#aaa;text-decoration:none;font-size:0.8rem">Back to Slices</a>
+      </div>
+      <canvas id="nv-canvas"></canvas>
+    </div>
+    <div id="debug-log"></div>
+
+    <div id="controls">
+        <label>Navigation Mode:</label><br/>
+        <select id="navMode" style="margin: 5px 0 10px 0; width: 100%">
+            <option value="world">Navigate World</option>
+            <option value="instance">Rotate Instance</option>
+        </select>
+        <br/>
+        <label>Colormap:</label><br/>
+        <select id="colormap" style="margin-top: 5px; width: 100%">
+            <option>Gray</option>
+            <option>Plasma</option>
+            <option>Viridis</option>
+            <option>Hot</option>
+        </select>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "gl-matrix": "https://esm.sh/gl-matrix@3.4.4",
+          "cbor-x": "https://esm.sh/cbor-x@1.6.0",
+          "nifti-reader-js": "https://esm.sh/nifti-reader-js@0.8.0",
+          "earcut": "https://esm.sh/earcut@3.0.2",
+          "clipper2-ts": "https://esm.sh/clipper2-ts@2.0.1-13"
+        }
+      }
+    </script>
+    <script type="module">
+        import NiiVue from '/vendor/niivuegpu/niivuegpu.webgl2.js?v=10';
+
+        const debugLog = document.getElementById('debug-log');
+        const log = (msg) => {
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            debugLog.appendChild(div);
+            debugLog.scrollTop = debugLog.scrollHeight;
+        };
+
+        const canvas = document.getElementById('nv-canvas');
+        const navModeEl = document.getElementById('navMode');
+        const colormapEl = document.getElementById('colormap');
+
+        async function main() {
+            log('Starting Infinite Desktop...');
+            const api = await fetch('/api').then(r => r.json());
+            const volumeDefs = api.volumes || [];
+            if (volumeDefs.length === 0) throw new Error('No volumes found');
+
+            const nvs = [];
+            const cols=3, rows=3, tileSize=0.28, gap=0.04;
+            for (let r=0; r<rows; r++) {
+                for (let c=0; c<cols; c++) {
+                    const volDef = volumeDefs[(r*cols+c)%volumeDefs.length];
+                    const nv = new NiiVue({
+                        backgroundColor: [0.1, 0.1, 0.1, 1],
+                        bounds: [[c*(tileSize+gap)+0.05, r*(tileSize+gap)+0.05], [c*(tileSize+gap)+tileSize+0.05, r*(tileSize+gap)+tileSize+0.05]],
+                        showBoundsBorder: true,
+                        placeholderText: '',
+                        isInteractionEnabled: false
+                    });
+                    await nv.attachToCanvas(canvas);
+                    nv.sliceType = 4;
+                    const url = `/volumes/${volDef.id}/raw?level=2`;
+                    log(`Loading tile ${nvs.length+1}...`);
+                    await nv.loadVolumes([{ url, colormap: 'Gray' }]);
+                    nvs.push(nv);
+                }
+            }
+
+            log('Grid ready.');
+            let viewport = { pan: [0,0], zoom: 1 };
+            let currentMode = 'world';
+
+            const updateAll = () => {
+                const gl = canvas.getContext('webgl2');
+                if (gl) {
+                    gl.disable(gl.SCISSOR_TEST);
+                    gl.clearColor(0.05, 0.05, 0.05, 1);
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                }
+                for (const nv of nvs) nv.setViewport(viewport);
+            };
+
+            navModeEl.onchange = () => {
+                currentMode = navModeEl.value;
+                log('Mode: ' + currentMode);
+                for (const nv of nvs) {
+                    if (currentMode === 'world') nv.disableInteraction();
+                    else nv.enableInteraction();
+                }
+            };
+
+            canvas.addEventListener('wheel', (e) => {
+                if (currentMode !== 'world') return;
+                e.preventDefault();
+                viewport.zoom *= e.deltaY > 0 ? 0.9 : 1.1;
+                updateAll();
+            }, { passive: false });
+
+            let isPanning = false;
+            let lastPos = [0, 0];
+            canvas.addEventListener('pointerdown', (e) => {
+                if (currentMode === 'world' && e.button === 0) {
+                    isPanning = true;
+                    lastPos = [e.clientX, e.clientY];
+                    canvas.setPointerCapture(e.pointerId);
+                }
+            });
+            canvas.addEventListener('pointermove', (e) => {
+                if (!isPanning) return;
+                viewport.pan[0] += (e.clientX - lastPos[0]) / canvas.width;
+                viewport.pan[1] -= (e.clientY - lastPos[1]) / canvas.height;
+                lastPos = [e.clientX, e.clientY];
+                updateAll();
+            });
+            canvas.addEventListener('pointerup', (e) => {
+                isPanning = false;
+                canvas.releasePointerCapture(e.pointerId);
+            });
+
+            colormapEl.onchange = () => {
+                const cm = colormapEl.value;
+                for (const nv of nvs) {
+                    nv.setVolume(0, { colormap: cm });
+                    nv.drawScene();
+                }
+            };
+
+            updateAll();
+            log('Ready!');
+        }
+
+        main().catch(err => {
+            console.error(err);
+            log('FATAL: ' + err.message);
+        });
+    </script>
+  </body>
+</html>
