@@ -1,4 +1,4 @@
-import NiiVue from '/vendor/niivuegpu/niivuegpu.webgl2.js?v=11';
+import NiiVue, { NVCanvasViewportController } from '/vendor/niivuegpu/niivuegpu.webgl2.js?v=70';
 
 const canvas = document.getElementById('nv-canvas');
 const navModeEl = document.getElementById('navMode');
@@ -13,22 +13,21 @@ const log = (msg) => {
 };
 
 async function main() {
-    log('Starting Infinite Desktop...');
+    log('Starting Coordinated Static Sheet...');
     const api = await fetch('/api').then(r => r.json());
     const volumeDefs = api.volumes || [];
-    if (volumeDefs.length === 0) {
-        log('No volumes found on server.');
-        return;
-    }
+    if (volumeDefs.length === 0) return;
 
-    const cols = 3, rows = 3, tileSize = 0.28, gap = 0.04;
+    const cols = 10, rows = 9;
+    const tileSize = 0.1, gap = 0.0; 
+    
     const instances = [];
     for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
             const volDef = volumeDefs[(r * cols + c) % volumeDefs.length];
             instances.push({
                 volDef,
-                bounds: [[c*(tileSize+gap) + 0.05, r*(tileSize+gap) + 0.05], [c*(tileSize+gap)+tileSize + 0.05, r*(tileSize+gap)+tileSize + 0.05]]
+                bounds: [[c*tileSize, r*tileSize], [(c+1)*tileSize, (r+1)*tileSize]]
             });
         }
     }
@@ -40,114 +39,78 @@ async function main() {
         const nv = new NiiVue({
             backgroundColor: [0.1, 0.1, 0.1, 1],
             bounds: inst.bounds,
-            showBoundsBorder: true,
+            showBoundsBorder: false,
             isColorbarVisible: false,
             loadingText: '',
-            placeholderText: ''
+            placeholderText: '',
+            isInteractionEnabled: false, // World navigation mode by default
+            isDragDropEnabled: false,
+            preserveDrawingBuffer: true 
         });
         
         await nv.attachToCanvas(canvas);
         nv.sliceType = 4; // 3D Render
         
-        const url = inst.volDef.levels?.find(l => l.level === 2) 
-            ? `/volumes/${inst.volDef.id}/raw?level=2` 
-            : `/volumes/${inst.volDef.id}/raw`;
+        const url = inst.volDef.levels?.find(l => l.level === 3) 
+            ? `/volumes/${inst.volDef.id}/raw?level=3` 
+            : `/volumes/${inst.volDef.id}/raw?level=2`;
         
-        log(`Loading tile ${i+1}/${instances.length}: ${inst.volDef.id}...`);
+        if (i % 20 === 0) log(`Loading tile ${i+1}/${instances.length}...`);
         await nv.loadVolumes([{ url, colormap: 'Gray' }]);
         nvs.push(nv);
-        
-        // Trigger redraw to keep tiles visible as they load
-        nv.drawScene(); 
     }
 
-    log('All tiles loaded. Grid ready.');
+    log('Grid ready. Coordination active.');
 
     let viewport = { pan: [0, 0], zoom: 1 };
     let currentMode = 'world';
 
-    const updateAll = () => {
-        // MASTER CLEAR: Since we use preserveDrawingBuffer, we MUST clear the 
-        // whole canvas before tiles redraw.
-        const gl = canvas.getContext('webgl2');
-        if (gl) {
-            gl.disable(gl.SCISSOR_TEST); // Clear entire buffer
-            gl.clearColor(0.05, 0.05, 0.05, 1);
-            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-        }
-        
-        // Coordination: Only call setViewport on the FIRST tile.
-        // The library core now fans this out to all siblings.
-        if (nvs.length > 0) {
-            nvs[0].setViewport(viewport);
-        }
-    };
+    if (NVCanvasViewportController) {
+        const controller = new NVCanvasViewportController(canvas, {
+            apply: (vp) => {
+                if (currentMode === 'world') {
+                    viewport = vp;
+                    // Library handles sibling sync internally via setViewport -> requestSyncFrame
+                    if (nvs.length > 0) nvs[0].setViewport(viewport);
+                }
+            },
+            getViewport: () => viewport,
+            panButton: 0,
+            minZoom: 0.001, 
+            maxZoom: 500,
+            inertia: true
+        });
+        controller.attach();
 
-    navModeEl.onchange = () => {
-        currentMode = navModeEl.value;
-        log('Mode changed to: ' + currentMode);
-        
-        for (const nv of nvs) {
-            // Toggle drag mode on each instance
-            // 0 = NONE, 1 = Standard (rotate/pan)
-            nv.opts.dragMode = (currentMode === 'world') ? 0 : 1;
-        }
-    };
-    navModeEl.value = 'world';
-    navModeEl.onchange();
+        navModeEl.onchange = () => {
+            currentMode = navModeEl.value;
+            log('Mode: ' + currentMode);
+            if (currentMode === 'world') {
+                controller.setOptions({ panButton: 0, wheelEnabled: true });
+                for (const nv of nvs) nv.disableInteraction();
+            } else {
+                controller.setOptions({ panButton: -1, wheelEnabled: false });
+                for (const nv of nvs) nv.enableInteraction();
+            }
+        };
+        // Ensure starting state is synchronized
+        navModeEl.value = 'world';
+        navModeEl.onchange();
+    }
 
-    canvas.addEventListener('wheel', (e) => {
-        if (currentMode !== 'world') return;
-        e.preventDefault();
-        const delta = e.deltaY > 0 ? 0.9 : 1.1;
-        viewport.zoom *= delta;
-        updateAll();
-    }, { passive: false });
-
-    let isPanning = false;
-    let lastPos = [0, 0];
-    
-    canvas.addEventListener('pointerdown', (e) => {
-        if (currentMode === 'world' && e.button === 0) {
-            isPanning = true;
-            lastPos = [e.clientX, e.clientY];
-            canvas.setPointerCapture(e.pointerId);
-        }
-    });
-
-    canvas.addEventListener('pointermove', (e) => {
-        if (!isPanning) return;
-        // Check for 0 canvas size to prevent disappearing tiles
-        if (canvas.width === 0 || canvas.height === 0) return;
-        
-        viewport.pan[0] += (e.clientX - lastPos[0]) / (canvas.width / window.devicePixelRatio);
-        viewport.pan[1] -= (e.clientY - lastPos[1]) / (canvas.height / window.devicePixelRatio);
-        lastPos = [e.clientX, e.clientY];
-        updateAll();
-    });
-
-    canvas.addEventListener('pointerup', (e) => {
-        if (isPanning) {
-            isPanning = false;
-            canvas.releasePointerCapture(e.pointerId);
-        }
-    });
-    
-    canvas.addEventListener('contextmenu', e => e.preventDefault());
-
-    colormapEl.onchange = () => {
-        const cm = colormapEl.value;
+    colormapEl.onchange = (e) => {
+        const cm = e.target.value;
         for (const nv of nvs) {
             nv.setVolume(0, { colormap: cm });
-            nv.drawScene();
         }
     };
 
-    updateAll();
-    log('Ready! Drag to pan, scroll to zoom.');
+    // Initial render
+    if (nvs.length > 0) nvs[0].setViewport(viewport);
+    log('Ready! Panning/Zooming will now affect all tiles uniformly.');
 }
 
 main().catch(err => {
     console.error(err);
-    log('FATAL: ' + err.message);
+    log(`FATAL: ${err.message}`);
 });
